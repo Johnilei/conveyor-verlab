@@ -1,0 +1,348 @@
+from pybaselines import Baseline
+import pandas as pd
+import plotly.express as px
+import numpy as np
+from scipy.signal import detrend
+from scipy import integrate
+from scipy import signal
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+
+PATH_DIR = "C:/Users/romeu/OneDrive/Área de Trabalho/Trabalho/SIF-DI241794-SISTEMA-INERCIAL-COM-HADRWARE-FLEX-VEL/192.168.1.111_20250704_034011.csv" 
+df = pd.read_csv(PATH_DIR)
+sensor_dest = ["192.168.1.111", "", ""]
+
+if any(sensor in PATH_DIR for sensor in sensor_dest):
+    df = df.rename(columns={
+        'x_data': 'x_data',
+        'y_data': 'x_gyro',
+        'z_data': 'y_data',
+        'x_gyro': 'y_gyro',
+        'y_gyro': 'z_data',
+        'z_gyro': 'z_gyro'
+        # temp continua igual
+    })
+
+print(df.head())
+# Parâmetros de conversão
+RANGE_ACC = 16  # RANGE em G
+RANGE_GYRO = 2000  # RANGE em dps
+CONVERSION_FACTOR_ACC = ((2 * RANGE_ACC) / (2**15)) * 9.81  # Fator de conversão para m/s²
+CONVERSION_FACTOR_GYRO = ((2 * RANGE_GYRO) / (2**15))  # Fator de conversão para °/s
+DT = 0.02
+BELT_SPEED = 6  # m/s
+BELT_LENGTH = 1000  # m
+
+# Parâmetros filtro passa-baixa
+LOWPASS_CUTOFF_ACC = 5
+LOWPASS_CUTOFF_GYRO = 5
+FILTER_ORDER_ACC = 4
+FILTER_ORDER_GYRO = 4
+
+# X axis base: distância = 1, tempo = 2, amostra = 3,
+AXIS_SELECTION = 2
+
+def get_x_base_label(axis):
+    if axis == 1:
+        return "distância[m]"
+    elif axis == 2:
+        return "tempo[s]"
+    elif axis == 3:
+        return "amostra"
+
+x_base_label = get_x_base_label(AXIS_SELECTION)
+
+def filter_signal(data, cutoff, order, dt):
+    fs = 1 / dt
+    lowpass_filter = signal.butter(order, cutoff, btype='lowpass', fs=fs, output='sos')
+    filtered_signal = signal.sosfilt(lowpass_filter, data)
+    return filtered_signal
+
+def process_sensor_data(acc_signal, gyro_signal):
+
+    sample = np.arange(len(acc_signal))
+    acc_signal_ms2 = np.array(acc_signal, dtype=float) * CONVERSION_FACTOR_ACC
+    gyro_signal_dps = np.array(gyro_signal, dtype=float) * CONVERSION_FACTOR_GYRO
+
+    # Filtro passa-baixa
+    acc_signal_filtered = filter_signal(acc_signal_ms2, LOWPASS_CUTOFF_ACC, FILTER_ORDER_ACC, DT)
+    gyro_signal_filtered = filter_signal(gyro_signal_dps, LOWPASS_CUTOFF_GYRO, FILTER_ORDER_GYRO, DT)
+
+    # Detrend
+    acc_signal_detrended = detrend(acc_signal_filtered, type='constant')
+    gyro_signal_detrended = detrend(gyro_signal_filtered, type='constant')
+
+    # Calculo de velocidade
+    speed = integrate.cumulative_trapezoid(acc_signal_detrended, dx=DT, initial=0)
+    baseline_fitter_speed = Baseline(x_data=sample)
+    half_window = 25
+    speed_drift, _ = baseline_fitter_speed.std_distribution(speed, half_window, smooth_half_window=10)
+    speed_corrected = speed - speed_drift
+
+    # Calculo de ângulo
+    degree = integrate.cumulative_trapezoid(gyro_signal_detrended, dx=DT, initial=0)
+    baseline_fitter_degree = Baseline(x_data=sample)
+    degree_drift, _ = baseline_fitter_degree.std_distribution(degree, half_window, smooth_half_window=10)
+    degree_corrected = degree - degree_drift
+
+    if x_base_label == "distância[m]":
+        sample_x_axis = DT * BELT_SPEED * sample
+    elif x_base_label == "tempo[s]":
+        sample_x_axis = DT * sample
+    else:
+        sample_x_axis = sample
+
+    # Monta dataframes
+    acc_data_df = pd.DataFrame({x_base_label: sample_x_axis, "m/s²": acc_signal_ms2})
+    speed_data_df = pd.DataFrame({x_base_label: sample_x_axis, "m/s": speed_corrected})
+    gyro_data_df = pd.DataFrame({x_base_label: sample_x_axis, "°/s": gyro_signal_detrended})
+    degree_data_df = pd.DataFrame({x_base_label: sample_x_axis, "°": degree_corrected})
+
+    return acc_data_df, speed_data_df, gyro_data_df, degree_data_df
+
+def process_temperature_data(temp_values):
+    sample = np.arange(len(temp_values))
+    temp_data_celsius = (np.array(temp_values, dtype=float) / 132.48) + 25
+    temp_data_celsius_avg = np.mean(temp_data_celsius)
+    temp_df = pd.DataFrame({"amostra": sample, "°C": temp_data_celsius_avg})
+    return temp_df
+
+def combine_acc_vel_data(acc_df, vel_df):
+    combined_data = pd.concat([acc_df, vel_df], keys=['Aceleração', 'Velocidade'])
+    melted_data = pd.melt(combined_data.reset_index(), id_vars=[x_base_label], value_vars=['m/s²', 'm/s'], var_name='Série', value_name='Valor')
+    return melted_data
+
+def combine_gyro_degree_data(gyro_df, degree_df):
+    combined_data = pd.concat([gyro_df, degree_df], keys=['Velocidade Angular', 'Ângulo'])
+    melted_data = pd.melt(combined_data.reset_index(), id_vars=[x_base_label], value_vars=['°/s', '°'], var_name='Série', value_name='Valor')
+    return melted_data
+
+df_acc_x, df_speed_x, df_gyro_x, df_degree_x = process_sensor_data(df['x_data'], df['y_data'])
+df_acc_y, df_speed_y, df_gyro_y, df_degree_y = process_sensor_data(df['z_data'], df['x_gyro'])
+df_acc_z, df_speed_z, df_gyro_z, df_degree_z = process_sensor_data(df['y_gyro'], df['z_gyro'])
+
+df_temp = process_temperature_data(df['temp'])
+
+# Gráfico de aceleração nos 3 eixos
+fig, axs = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+fig.suptitle("Aceleração nos Eixos X, Y e Z")
+
+
+
+melted_data_acc_x = combine_acc_vel_data(df_acc_x, df_speed_x)
+melted_data_acc_y = combine_acc_vel_data(df_acc_y, df_speed_y)
+melted_data_acc_z = combine_acc_vel_data(df_acc_z, df_speed_z)
+
+melted_data_gyro_x = combine_gyro_degree_data(df_gyro_x, df_degree_x)
+melted_data_gyro_y = combine_gyro_degree_data(df_gyro_y, df_degree_y)
+melted_data_gyro_z = combine_gyro_degree_data(df_gyro_z, df_degree_z)
+
+# Gráfico combinado de aceleração e velocidade
+def plot_acceleration_and_velocity():
+    fig, axs = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    fig.suptitle("Aceleração e Velocidade")
+
+    # Subplot para o eixo X
+    axs[0].plot(df_acc_x[x_base_label], df_acc_x["m/s²"], label="Aceleração X", color="blue")
+    axs[0].plot(df_speed_x[x_base_label], df_speed_x["m/s"], label="Velocidade X", color="cyan")
+    axs[0].set_ylabel("Valor")
+    axs[0].legend()
+    axs[0].grid()
+
+    # Subplot para o eixo Y
+    axs[1].plot(df_acc_y[x_base_label], df_acc_y["m/s²"], label="Aceleração Y", color="green")
+    axs[1].plot(df_speed_y[x_base_label], df_speed_y["m/s"], label="Velocidade Y", color="lime")
+    axs[1].set_ylabel("Valor")
+    axs[1].legend()
+    axs[1].grid()
+
+    # Subplot para o eixo Z
+    axs[2].plot(df_acc_z[x_base_label], df_acc_z["m/s²"], label="Aceleração Z", color="red")
+    axs[2].plot(df_speed_z[x_base_label], df_speed_z["m/s"], label="Velocidade Z", color="orange")
+    axs[2].set_xlabel(x_base_label)
+    axs[2].set_ylabel("Valor")
+    axs[2].legend()
+    axs[2].grid()
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+# Gráfico combinado de velocidade angular e ângulo
+def plot_gyro_and_degree():
+    fig, axs = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    fig.suptitle("Velocidade Angular e Ângulo")
+
+    # Subplot para o eixo X
+    axs[0].plot(df_gyro_x[x_base_label], df_gyro_x["°/s"], label="Velocidade Angular X", color="blue")
+    axs[0].plot(df_degree_x[x_base_label], df_degree_x["°"], label="Ângulo X", color="cyan")
+    axs[0].set_ylabel("Valor")
+    axs[0].legend()
+    axs[0].grid()
+
+    # Subplot para o eixo Y
+    axs[1].plot(df_gyro_y[x_base_label], df_gyro_y["°/s"], label="Velocidade Angular Y", color="green")
+    axs[1].plot(df_degree_y[x_base_label], df_degree_y["°"], label="Ângulo Y", color="lime")
+    axs[1].set_ylabel("Valor")
+    axs[1].legend()
+    axs[1].grid()
+
+    # Subplot para o eixo Z
+    axs[2].plot(df_gyro_z[x_base_label], df_gyro_z["°/s"], label="Velocidade Angular Z", color="red")
+    axs[2].plot(df_degree_z[x_base_label], df_degree_z["°"], label="Ângulo Z", color="orange")
+    axs[2].set_xlabel(x_base_label)
+    axs[2].set_ylabel("Valor")
+    axs[2].legend()
+    axs[2].grid()
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+# Gráfico de temperatura
+def plot_temperature():
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(df_temp["amostra"], df_temp["°C"], label="Temperatura", color="purple")
+    ax.set_title("Temperatura")
+    ax.set_xlabel("Amostra")
+    ax.set_ylabel("Temperatura (°C)")
+    ax.legend()
+    ax.grid()
+    plt.show()
+
+# Correlação Cruzada - Eixos X e Z
+def cross_correlation(data):
+    acc_x = np.array(data['x_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_y = np.array(data['y_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_z = np.array(data['z_data'], dtype=float) * CONVERSION_FACTOR_ACC
+
+    plt.figure(figsize=(10, 6))
+    plt.xcorr(acc_x, acc_z, maxlags=100, usevlines=True, normed=True, label="X vs Z")
+    plt.title("Correlação Cruzada - Eixos X e Z")
+    plt.xlabel("Defasagem")
+    plt.ylabel("Correlação")
+    plt.grid()
+    plt.legend()
+    plt.show()
+
+def calculate_rms(data):
+    acc_x = np.array(data['x_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_y = np.array(data['y_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_z = np.array(data['z_data'], dtype=float) * CONVERSION_FACTOR_ACC
+
+    rms_x = np.sqrt(np.mean(acc_x**2))
+    rms_y = np.sqrt(np.mean(acc_y**2))
+    rms_z = np.sqrt(np.mean(acc_z**2))
+
+    print(f"RMS X: {rms_x:.2f}, RMS Y: {rms_y:.2f}, RMS Z: {rms_z:.2f}")
+
+def correct_gravity_dynamically(data):
+    # Conversão dos dados do acelerômetro
+    acc_x = np.array(data['x_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_y = np.array(data['y_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_z = np.array(data['z_data'], dtype=float) * CONVERSION_FACTOR_ACC
+
+    # Calcular a magnitude total da gravidade
+    acc_magnitude = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+
+    # Filtro passa-baixa para estimar a gravidade
+    gravity_magnitude = filter_signal(acc_magnitude, cutoff=0.1, order=4, dt=DT)
+
+    # Estimar os componentes da gravidade em cada eixo
+    gravity_x = (acc_x / acc_magnitude) * gravity_magnitude
+    gravity_y = (acc_y / acc_magnitude) * gravity_magnitude
+    gravity_z = (acc_z / acc_magnitude) * gravity_magnitude
+
+    # Remover os componentes da gravidade
+    acc_x_corrected = acc_x - gravity_x
+    acc_y_corrected = acc_y - gravity_y
+    acc_z_corrected = acc_z - gravity_z
+
+    return acc_x_corrected, acc_y_corrected, acc_z_corrected
+
+def moving_average(data, window_size):
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+
+def calculate_displacement(data):
+    # Conversão dos dados do acelerômetro
+    acc_x = np.array(data['x_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_y = np.array(data['y_data'], dtype=float) * CONVERSION_FACTOR_ACC
+    acc_z = np.array(data['z_data'], dtype=float) * CONVERSION_FACTOR_ACC
+
+    # Remoção do componente da gravidade no eixo Z
+    acc_z_corrected = acc_z - np.mean(acc_z)  # Remove o valor médio (assumindo que a gravidade é constante)
+
+    # Remoção de possíveis desvios DC nos eixos X e Y
+    acc_x_corrected = acc_x - np.mean(acc_x)
+    acc_y_corrected = acc_y - np.mean(acc_y)
+
+    # Cálculo do deslocamento acumulado
+    disp_x = integrate.cumulative_trapezoid(acc_x_corrected, dx=DT, initial=0)
+    disp_y = integrate.cumulative_trapezoid(acc_y_corrected, dx=DT, initial=0)
+    disp_z = integrate.cumulative_trapezoid(acc_z_corrected, dx=DT, initial=0)
+
+    # Plot dos deslocamentos acumulados
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.arange(len(disp_x)) * DT, disp_x, label="Deslocamento X", color="blue")
+    plt.plot(np.arange(len(disp_y)) * DT, disp_y, label="Deslocamento Y", color="green")
+    plt.plot(np.arange(len(disp_z)) * DT, disp_z, label="Deslocamento Z", color="red")
+    plt.title("Deslocamento Acumulado - Eixos X, Y e Z")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("Deslocamento (m)")
+    plt.grid()
+    plt.legend()
+    plt.show()
+
+def remove_outliers(data, threshold=3):
+    """Remove outliers com base no desvio padrão."""
+    mean = np.mean(data)
+    std = np.std(data)
+    return np.array([x if abs(x - mean) < threshold * std else mean for x in data])
+
+def calculate_displacement_dynamic(data):
+    # Corrigir dinamicamente o componente da gravidade
+    acc_x_corrected, acc_y_corrected, acc_z_corrected = correct_gravity_dynamically(data)
+
+    # Aplicar detrend para remover tendências
+    acc_x_corrected = detrend(acc_x_corrected, type='linear')
+    acc_y_corrected = detrend(acc_y_corrected, type='linear')
+    acc_z_corrected = detrend(acc_z_corrected, type='linear')
+
+    # Remover outliers
+    acc_x_corrected = remove_outliers(acc_x_corrected)
+    acc_y_corrected = remove_outliers(acc_y_corrected)
+    acc_z_corrected = remove_outliers(acc_z_corrected)
+
+    # Suavizar os dados com filtro Savitzky-Golay (ajustado para cada eixo)
+    acc_x_corrected = savgol_filter(acc_x_corrected, window_length=51, polyorder=3)
+    acc_y_corrected = savgol_filter(acc_y_corrected, window_length=51, polyorder=3)
+    acc_z_corrected = savgol_filter(acc_z_corrected, window_length=51, polyorder=3)
+
+    # Cálculo do deslocamento acumulado
+    disp_x = integrate.cumulative_trapezoid(acc_x_corrected, dx=DT, initial=0)
+    disp_y = integrate.cumulative_trapezoid(acc_y_corrected, dx=DT, initial=0)
+    disp_z = integrate.cumulative_trapezoid(acc_z_corrected, dx=DT, initial=0)
+
+    # Aplicar filtro passa-alta para remover drift
+    disp_x = detrend(disp_x, type='linear')
+    disp_y = detrend(disp_y, type='linear')
+    disp_z = detrend(disp_z, type='linear')
+
+    # Suavizar os deslocamentos acumulados com média móvel
+    disp_x = moving_average(disp_x, window_size=30)
+    disp_y = moving_average(disp_y, window_size=30)
+    disp_z = moving_average(disp_z, window_size=30)
+
+    # Plot dos deslocamentos acumulados
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.arange(len(disp_x)) * DT, disp_x, label="Deslocamento X", color="blue")
+    plt.plot(np.arange(len(disp_y)) * DT, disp_y, label="Deslocamento Y", color="green")
+    plt.plot(np.arange(len(disp_z)) * DT, disp_z, label="Deslocamento Z", color="red")
+    plt.title("Deslocamento Acumulado - Eixos X, Y e Z (Correção Avançada)")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("Deslocamento (m)")
+    plt.grid()
+    plt.legend()
+    plt.show()
+
+# Chamar a função com correção dinâmica
+calculate_displacement_dynamic(df)
+
